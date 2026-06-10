@@ -1,0 +1,145 @@
+# Benchmark "top" written by ABC on Wed Jan  8 19:11:04 2025
+.model top
+.inputs dest_x[0] dest_x[1] dest_x[2] dest_x[3] dest_x[4] dest_x[5] \
+ dest_x[6] dest_x[7] dest_x[8] dest_x[9] dest_x[10] dest_x[11] dest_x[12] \
+ dest_x[13] dest_x[14] dest_x[15] dest_x[16] dest_x[17] dest_x[18] \
+ dest_x[19] dest_x[20] dest_x[21] dest_x[22] dest_x[23] dest_x[24] \
+ dest_x[25] dest_x[26] dest_x[27] dest_x[28] dest_x[29] dest_y[0] dest_y[1] \
+ dest_y[2] dest_y[3] dest_y[4] dest_y[5] dest_y[6] dest_y[7] dest_y[8] \
+ dest_y[9] dest_y[10] dest_y[11] dest_y[12] dest_y[13] dest_y[14] \
+ dest_y[15] dest_y[16] dest_y[17] dest_y[18] dest_y[19] dest_y[20] \
+ dest_y[21] dest_y[22] dest_y[23] dest_y[24] dest_y[25] dest_y[26] \
+ dest_y[27] dest_y[28] dest_y[29]
+.outputs outport[0] outport[1] outport[2] outport[3] outport[4] outport[5] \
+ outport[6] outport[7] outport[8] outport[9] outport[10] outport[11] \
+ outport[12] outport[13] outport[14] outport[15] outport[16] outport[17] \
+ outport[18] outport[19] outport[20] outport[21] outport[22] outport[23] \
+ outport[24] outport[25] outport[26] outport[27] outport[28] outport[29]
+.names new_n95 new_n92 outport[0]
+01 0
+.names dest_x[26] new_n93 dest_x[13] dest_x[16] dest_x[21] dest_x[22] \
+ dest_x[11] dest_x[14] dest_x[15] new_n94 dest_x[28] dest_x[25] dest_x[23] \
+ dest_x[24] dest_x[27] dest_x[29] new_n92
+--00001111111111 1
+-0--------111111 1
+0000001111-11111 1
+1---------1---11 1
+.names dest_x[9] dest_x[10] dest_x[11] dest_x[15] dest_x[14] dest_x[17] \
+ dest_x[20] dest_x[19] dest_x[12] dest_x[13] dest_x[16] dest_x[18] \
+ dest_x[21] dest_x[22] new_n93
+-------0----00 1
+------0-----00 1
+-----0-----000 1
+----0-----0000 1
+---0------0000 1
+--0-----000000 1
+00------000000 1
+.names dest_x[9] dest_x[10] dest_x[12] dest_x[18] dest_x[4] dest_x[5] \
+ dest_x[6] dest_x[7] dest_x[8] dest_x[0] dest_x[1] dest_x[2] dest_x[17] \
+ dest_x[3] dest_x[19] dest_x[20] new_n94
+0000111111111111 1
+.names dest_x[16] dest_x[21] dest_x[22] dest_x[13] dest_x[11] dest_x[15] \
+ dest_x[14] new_n96 dest_x[25] dest_x[24] dest_x[23] new_n93 dest_x[28] \
+ dest_x[26] new_n95
+------------0- 0
+-----------1-0 0
+----------0--0 0
+---------0---0 0
+--------0----0 0
+00001111-----0 0
+.names dest_x[1] dest_x[2] dest_x[3] dest_x[4] dest_x[5] dest_x[6] \
+ dest_x[7] dest_x[8] dest_x[10] dest_x[12] dest_x[18] dest_x[9] new_n96
+000000000001 1
+.names new_n100 new_n95 dest_y[9] dest_y[10] new_n101 new_n102 dest_y[1] \
+ dest_y[19] dest_y[20] dest_x[0] dest_y[0] new_n98 dest_y[27] dest_y[28] \
+ dest_y[29] new_n92 outport[1]
+----------111111 0
+---------1-11111 0
+--001111101-1111 0
+--0011111011-111 0
+-1-------------1 0
+0----------11111 0
+.names dest_y[18] new_n99 dest_y[22] dest_y[21] dest_y[26] dest_y[19] \
+ dest_y[20] dest_y[24] dest_y[25] dest_y[23] new_n98
+----1----- 1
+---1---111 1
+--1----111 1
+-1---11111 1
+1----11111 1
+.names dest_y[10] dest_y[9] dest_y[13] dest_y[12] dest_y[16] dest_y[11] \
+ dest_y[15] dest_y[14] dest_y[17] new_n99
+----1---1 1
+---1--111 1
+--1---111 1
+-1---1111 1
+1----1111 1
+.names dest_y[1] dest_y[2] dest_y[3] dest_y[4] dest_y[5] dest_y[6] \
+ dest_y[7] dest_y[8] dest_y[10] dest_y[9] new_n101 dest_y[19] dest_y[20] \
+ new_n100
+0000000001111 1
+.names dest_y[12] dest_y[13] dest_y[16] dest_y[18] dest_y[21] dest_y[22] \
+ dest_y[26] dest_y[14] dest_y[15] dest_y[11] dest_y[23] dest_y[24] \
+ dest_y[25] dest_y[17] new_n101
+00000001111111 1
+.names dest_y[2] dest_y[3] dest_y[4] dest_y[5] dest_y[6] dest_y[7] \
+ dest_y[8] new_n102
+1111111 1
+.names dest_x[0] dest_y[0] new_n100 outport[0] new_n98 dest_y[27] \
+ dest_y[28] dest_y[29] outport[2]
+--001111 1
+11-01111 1
+.names outport[3]
+ 0
+.names outport[4]
+ 0
+.names outport[5]
+ 0
+.names outport[6]
+ 0
+.names outport[7]
+ 0
+.names outport[8]
+ 0
+.names outport[9]
+ 0
+.names outport[10]
+ 0
+.names outport[11]
+ 0
+.names outport[12]
+ 0
+.names outport[13]
+ 0
+.names outport[14]
+ 0
+.names outport[15]
+ 0
+.names outport[16]
+ 0
+.names outport[17]
+ 0
+.names outport[18]
+ 0
+.names outport[19]
+ 0
+.names outport[20]
+ 0
+.names outport[21]
+ 0
+.names outport[22]
+ 0
+.names outport[23]
+ 0
+.names outport[24]
+ 0
+.names outport[25]
+ 0
+.names outport[26]
+ 0
+.names outport[27]
+ 0
+.names outport[28]
+ 0
+.names outport[29]
+ 0
+.end

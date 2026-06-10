@@ -1,0 +1,10 @@
+[package]
+name = "salus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aligned-vec = "=0.5.0"
+pulp = "=0.18.8"
+refined-tfhe-lhe = { path = "third_party/refined-tfhe-lhe" }
+tfhe = { version = "=0.5.4", features = ["boolean", "shortint", "x86_64-unix"] }

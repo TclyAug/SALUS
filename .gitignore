@@ -1,0 +1,10 @@
+target/
+logs/
+tools/__pycache__/
+abc.history
+third_party/abc/abc
+third_party/abc/**/*.o
+third_party/abc/**/*.d
+third_party/abc/**/*.a
+third_party/abc/**/*.so
+third_party/refined-tfhe-lhe/src/bin/*.blif

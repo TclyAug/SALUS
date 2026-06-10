@@ -1,0 +1,4 @@
+[submodule "third_party/abc"]
+	path = third_party/abc
+	url = https://github.com/berkeley-abc/abc.git
+	shallow = true
