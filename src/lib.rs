@@ -7,6 +7,7 @@ pub mod ms_noise_reduction;
 pub mod mux_tree;
 pub mod packed_groups;
 pub mod preprocessed;
+pub mod timing;
 
 pub use bdd::{Bdd, BddNode, ImportedBdd, ImportedBranchNode, ImportedEdge, NodeId};
 pub use blif::{reduce_lut_with_cudd, BlifCircuit, BlifError, BlifLut};
@@ -22,10 +23,12 @@ pub use cbs_multi3::{
 };
 pub use imported_dag::{parse_cudd_dag_str, read_cudd_dag_file, ImportedDagData};
 pub use mux_tree::{
-    evaluate_bdd, evaluate_bdd_with_refs, evaluate_logic_fn, evaluate_truth_table, MuxTreeError,
+    evaluate_bdd, evaluate_bdd_with_refs, evaluate_bdd_with_refs_timed, evaluate_logic_fn,
+    evaluate_truth_table, MuxTreeError,
 };
 pub use packed_groups::{build_merge_lut2_groups, build_packed_group, PackedLutGroup};
 pub use preprocessed::{
     from_blif_circuit_with_dags, write_packed_groups_to_dir, PreprocessedCircuit, PreprocessedLut,
     PreprocessedPackedGroup, PreprocessedPackedGroups,
 };
+pub use timing::{ComponentTimingStats, TimedStat};

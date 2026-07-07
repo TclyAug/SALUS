@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::time::Instant;
 
 use tfhe::core_crypto::prelude::*;
 
 use crate::bdd::{Bdd, BddNode, NodeId};
 use crate::cbs::{CircuitBootstrapKeys, SelectorCiphertext};
+use crate::timing::ComponentTimingStats;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MuxTreeError {
@@ -40,6 +42,26 @@ pub fn evaluate_bdd_with_refs(
     keys: &CircuitBootstrapKeys,
     delta: u64,
 ) -> Result<GlweCiphertext<Vec<u64>>, MuxTreeError> {
+    evaluate_bdd_with_refs_internal(bdd, selectors, keys, delta, None)
+}
+
+pub fn evaluate_bdd_with_refs_timed(
+    bdd: &Bdd,
+    selectors: &[&SelectorCiphertext],
+    keys: &CircuitBootstrapKeys,
+    delta: u64,
+    timing: &mut ComponentTimingStats,
+) -> Result<GlweCiphertext<Vec<u64>>, MuxTreeError> {
+    evaluate_bdd_with_refs_internal(bdd, selectors, keys, delta, Some(timing))
+}
+
+fn evaluate_bdd_with_refs_internal(
+    bdd: &Bdd,
+    selectors: &[&SelectorCiphertext],
+    keys: &CircuitBootstrapKeys,
+    delta: u64,
+    mut timing: Option<&mut ComponentTimingStats>,
+) -> Result<GlweCiphertext<Vec<u64>>, MuxTreeError> {
     let mut terminal_cache = HashMap::new();
     let mut node_cache = HashMap::new();
 
@@ -51,6 +73,7 @@ pub fn evaluate_bdd_with_refs(
         delta,
         &mut terminal_cache,
         &mut node_cache,
+        timing.as_deref_mut(),
     )
 }
 
@@ -87,6 +110,7 @@ fn evaluate_node(
     delta: u64,
     terminal_cache: &mut HashMap<u64, GlweCiphertext<Vec<u64>>>,
     node_cache: &mut HashMap<NodeId, GlweCiphertext<Vec<u64>>>,
+    mut timing: Option<&mut ComponentTimingStats>,
 ) -> Result<GlweCiphertext<Vec<u64>>, MuxTreeError> {
     if let Some(ciphertext) = node_cache.get(&node_id) {
         return Ok(ciphertext.clone());
@@ -122,6 +146,7 @@ fn evaluate_node(
                 delta,
                 terminal_cache,
                 node_cache,
+                timing.as_deref_mut(),
             )?;
             let mut high_ciphertext = evaluate_node(
                 bdd,
@@ -131,8 +156,13 @@ fn evaluate_node(
                 delta,
                 terminal_cache,
                 node_cache,
+                timing.as_deref_mut(),
             )?;
+            let cmux_start = Instant::now();
             cmux_assign(&mut low_ciphertext, &mut high_ciphertext, selector);
+            if let Some(stats) = timing.as_deref_mut() {
+                stats.record_cmux(cmux_start.elapsed());
+            }
             low_ciphertext
         }
     };

@@ -1,16 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use refined_tfhe_lhe::int_lhe_instance::{
     SALUS_CMUX0 as CMUX0_EVAL_PARAM, SALUS_CMUX1 as CMUX1_EVAL_PARAM,
 };
 use salus::{
-    encode_inter_group_standard_br_value, evaluate_bdd_with_refs,
-    inter_group_standard_br_bit_delta, Bdd, CircuitBootstrapKeys, ImportedDagData,
-    PreprocessedCircuit, SelectorCiphertext, FUSED_SELECTOR_GROUP_BITS,
+    encode_inter_group_standard_br_value, evaluate_bdd_with_refs, evaluate_bdd_with_refs_timed,
+    inter_group_standard_br_bit_delta, Bdd, CircuitBootstrapKeys, ComponentTimingStats,
+    ImportedDagData, PreprocessedCircuit, SelectorCiphertext, TimedStat, FUSED_SELECTOR_GROUP_BITS,
 };
 use tfhe::core_crypto::prelude::*;
 
@@ -36,6 +36,7 @@ struct RunReport {
     input_selector_bootstrap_ms: f64,
     bdd_eval_ms: f64,
     inter_lut_cb_ms: f64,
+    component_timing: Option<ComponentTimingStats>,
 }
 
 impl RunReport {
@@ -90,6 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let requested_grouped_inter_cb = take_flag(&mut optional_args, "--grouped-inter-cb");
     let requested_packed_merge_groups = take_flag(&mut optional_args, "--packed-merge-groups");
     let requested_legacy_debug_scalar_eval = take_flag(&mut optional_args, "--debug-eval-cmux0");
+    let component_timing_enabled = take_flag(&mut optional_args, "--component-timing");
     let fixed_seed = parse_u64_option(&mut optional_args, "--seed")?;
     let grouped_inter_level_limit =
         parse_usize_option(&mut optional_args, "--grouped-inter-level-limit")?;
@@ -219,6 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .or(cmux1_keys.as_ref())
         .expect("at least one key set must be available");
     let run_once = |primary_input_bits: &[u64]| -> Result<RunReport, Box<dyn Error>> {
+        let mut component_timing = component_timing_enabled.then(ComponentTimingStats::default);
         let plain_signal_values =
             evaluate_preprocessed_plain(&circuit, &dag_map, primary_input_bits)?;
         let expected_outputs = circuit
@@ -239,6 +242,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &circuit,
             primary_input_bits,
             use_grouped_input_cb,
+            component_timing.as_mut(),
         )?;
         let input_selector_bootstrap_ms = input_bootstrap_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -283,7 +287,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
 
-                    let bdd_start = Instant::now();
                     let packed_bdd_keys = if matches!(route, EvalRoute::Hybrid) {
                         cmux0_keys
                             .as_ref()
@@ -293,19 +296,46 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .as_ref()
                             .expect("grouped route requires cmux1 keys")
                     };
-                    let packed_glwe =
-                        evaluate_bdd_with_refs(packed_bdd, &selector_inputs, packed_bdd_keys, 1)?;
-                    total_bdd_ms += bdd_start.elapsed().as_secs_f64() * 1000.0;
+                    let bdd_start = Instant::now();
+                    let packed_glwe = if let Some(stats) = component_timing.as_mut() {
+                        evaluate_bdd_with_refs_timed(
+                            packed_bdd,
+                            &selector_inputs,
+                            packed_bdd_keys,
+                            1,
+                            stats,
+                        )?
+                    } else {
+                        evaluate_bdd_with_refs(packed_bdd, &selector_inputs, packed_bdd_keys, 1)?
+                    };
+                    let bdd_elapsed = bdd_start.elapsed();
+                    total_bdd_ms += bdd_elapsed.as_secs_f64() * 1000.0;
+                    if let Some(stats) = component_timing.as_mut() {
+                        stats.record_bdd_tree(bdd_elapsed, packed_bdd.branch_count());
+                        stats.record_packed_group_eval(bdd_elapsed, group.lut_indices.len());
+                    }
 
                     let cb_start = Instant::now();
                     let cmux1_keys = cmux1_keys
                         .as_ref()
                         .expect("grouped route requires cmux1 keys for packed multi-output CB");
-                    let selectors = cmux1_keys.packed_glwe_to_selectors_standard_br(
-                        &packed_glwe,
-                        group.lut_indices.len(),
-                    );
-                    total_cb_ms += cb_start.elapsed().as_secs_f64() * 1000.0;
+                    let selectors = if let Some(stats) = component_timing.as_mut() {
+                        cmux1_keys.packed_glwe_to_selectors_standard_br_timed(
+                            &packed_glwe,
+                            group.lut_indices.len(),
+                            stats,
+                        )
+                    } else {
+                        cmux1_keys.packed_glwe_to_selectors_standard_br(
+                            &packed_glwe,
+                            group.lut_indices.len(),
+                        )
+                    };
+                    let cb_elapsed = cb_start.elapsed();
+                    total_cb_ms += cb_elapsed.as_secs_f64() * 1000.0;
+                    if let Some(stats) = component_timing.as_mut() {
+                        stats.record_packed_group_refresh(cb_elapsed, group.lut_indices.len());
+                    }
 
                     for (selector_idx, (&lut_index, selector)) in
                         group.lut_indices.iter().zip(selectors.iter()).enumerate()
@@ -408,17 +438,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     .ok_or_else(|| format!("missing selector for {signal_name}"))
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        let bdd_start = Instant::now();
                         let cmux1_keys = cmux1_keys
                             .as_ref()
                             .expect("grouped route requires cmux1 keys");
-                        let lut_glwe = evaluate_bdd_with_refs(
-                            &bdd,
-                            &selector_inputs,
-                            cmux1_keys,
-                            cmux1_base_delta,
-                        )?;
-                        total_bdd_ms += bdd_start.elapsed().as_secs_f64() * 1000.0;
+                        let bdd_start = Instant::now();
+                        let lut_glwe = if let Some(stats) = component_timing.as_mut() {
+                            evaluate_bdd_with_refs_timed(
+                                &bdd,
+                                &selector_inputs,
+                                cmux1_keys,
+                                cmux1_base_delta,
+                                stats,
+                            )?
+                        } else {
+                            evaluate_bdd_with_refs(
+                                &bdd,
+                                &selector_inputs,
+                                cmux1_keys,
+                                cmux1_base_delta,
+                            )?
+                        };
+                        let bdd_elapsed = bdd_start.elapsed();
+                        total_bdd_ms += bdd_elapsed.as_secs_f64() * 1000.0;
+                        if let Some(stats) = component_timing.as_mut() {
+                            stats.record_bdd_tree(bdd_elapsed, bdd.branch_count());
+                            stats.record_grouped_lut_eval(bdd_elapsed);
+                        }
 
                         let actual_value =
                             verify_keys.decrypt_glwe_coefficient0(&lut_glwe, cmux1_base_delta);
@@ -471,9 +516,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let cmux1_keys = cmux1_keys
                         .as_ref()
                         .expect("grouped route requires cmux1 keys");
-                    let selectors =
-                        cmux1_keys.weighted_glwe_outputs_to_selectors_standard_br(&grouped_glwes);
-                    total_cb_ms += cb_start.elapsed().as_secs_f64() * 1000.0;
+                    let selectors = if let Some(stats) = component_timing.as_mut() {
+                        cmux1_keys.weighted_glwe_outputs_to_selectors_standard_br_timed(
+                            &grouped_glwes,
+                            stats,
+                        )
+                    } else {
+                        cmux1_keys.weighted_glwe_outputs_to_selectors_standard_br(&grouped_glwes)
+                    };
+                    let cb_elapsed = cb_start.elapsed();
+                    total_cb_ms += cb_elapsed.as_secs_f64() * 1000.0;
+                    if let Some(stats) = component_timing.as_mut() {
+                        stats.record_grouped_refresh(cb_elapsed, group_width);
+                    }
 
                     for ((name, expected_value), selector) in grouped_names
                         .into_iter()
@@ -514,7 +569,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
 
-                    let bdd_start = Instant::now();
                     let singleton_bdd_keys = if use_grouped_singletons {
                         cmux1_keys
                             .as_ref()
@@ -524,9 +578,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .as_ref()
                             .expect("single/hybrid route requires cmux0 keys for singleton LUTs")
                     };
-                    let lut_glwe =
-                        evaluate_bdd_with_refs(&bdd, &selector_inputs, singleton_bdd_keys, delta)?;
-                    total_bdd_ms += bdd_start.elapsed().as_secs_f64() * 1000.0;
+                    let bdd_start = Instant::now();
+                    let lut_glwe = if let Some(stats) = component_timing.as_mut() {
+                        evaluate_bdd_with_refs_timed(
+                            &bdd,
+                            &selector_inputs,
+                            singleton_bdd_keys,
+                            delta,
+                            stats,
+                        )?
+                    } else {
+                        evaluate_bdd_with_refs(&bdd, &selector_inputs, singleton_bdd_keys, delta)?
+                    };
+                    let bdd_elapsed = bdd_start.elapsed();
+                    total_bdd_ms += bdd_elapsed.as_secs_f64() * 1000.0;
+                    if let Some(stats) = component_timing.as_mut() {
+                        stats.record_bdd_tree(bdd_elapsed, bdd.branch_count());
+                        stats.record_singleton_lut_eval(bdd_elapsed);
+                    }
 
                     let actual_value = verify_keys.decrypt_glwe_coefficient0(&lut_glwe, delta);
                     if actual_value != expected_value {
@@ -578,8 +647,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .as_ref()
                             .expect("single/hybrid route requires cmux0 keys for singleton CB")
                     };
-                    let selector = singleton_cb_keys.glwe_boolean_to_selector(&lut_glwe);
-                    total_cb_ms += cb_start.elapsed().as_secs_f64() * 1000.0;
+                    let selector = if let Some(stats) = component_timing.as_mut() {
+                        singleton_cb_keys.glwe_boolean_to_selector_timed(&lut_glwe, stats)
+                    } else {
+                        singleton_cb_keys.glwe_boolean_to_selector(&lut_glwe)
+                    };
+                    let cb_elapsed = cb_start.elapsed();
+                    total_cb_ms += cb_elapsed.as_secs_f64() * 1000.0;
+                    if let Some(stats) = component_timing.as_mut() {
+                        stats.record_singleton_refresh(cb_elapsed);
+                    }
                     live_signals.insert(lut.name.clone(), selector);
                     level_index += 1;
                 }
@@ -612,11 +689,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
 
+        if let Some(stats) = component_timing.as_mut() {
+            let pure_server_compute_ms = input_selector_bootstrap_ms + total_bdd_ms + total_cb_ms;
+            stats.record_total_circuit_eval(Duration::from_secs_f64(
+                pure_server_compute_ms / 1000.0,
+            ));
+        }
+
         Ok(RunReport {
             actual_outputs,
             input_selector_bootstrap_ms,
             bdd_eval_ms: total_bdd_ms,
             inter_lut_cb_ms: total_cb_ms,
+            component_timing,
         })
     };
 
@@ -624,15 +709,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         let seed = fixed_seed.unwrap_or_else(now_seed);
         let mut rng = XorShift64::new(seed ^ 0x7265_7065_6174_7261_u64);
         let mut total_ms = 0.0;
+        let mut aggregate_component_timing =
+            component_timing_enabled.then(ComponentTimingStats::default);
 
         for run_idx in 0..repeat_count {
             let primary_input_bits = random_input_bits(circuit.inputs.len(), &mut rng);
             let report = run_once(&primary_input_bits)?;
             total_ms += report.pure_server_compute_ms();
+            if let (Some(aggregate), Some(run_timing)) = (
+                aggregate_component_timing.as_mut(),
+                report.component_timing.as_ref(),
+            ) {
+                aggregate.merge(run_timing);
+            }
             println!("run_{}:", run_idx + 1);
             println!("input_bits: {}", format_bits(&primary_input_bits));
             println!("output_bits: {}", format_bits(&report.actual_outputs));
-            println!("pure_server_compute_ms: {:.2}", report.pure_server_compute_ms());
+            println!(
+                "pure_server_compute_ms: {:.2}",
+                report.pure_server_compute_ms()
+            );
             println!("correct: true");
             if run_idx + 1 < repeat_count {
                 println!();
@@ -643,6 +739,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let average_ms = total_ms / repeat_count as f64;
         println!("average_pure_server_compute_ms: {:.2}", average_ms);
         println!("correct: true");
+        if let Some(stats) = aggregate_component_timing.as_ref() {
+            print_component_timing(stats);
+        }
     } else {
         let primary_input_bits =
             provided_input_bits.unwrap_or_else(|| vec![0; circuit.inputs.len()]);
@@ -650,8 +749,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         println!("input_bits: {}", format_bits(&primary_input_bits));
         println!("output_bits: {}", format_bits(&report.actual_outputs));
-        println!("pure_server_compute_ms: {:.2}", report.pure_server_compute_ms());
+        println!(
+            "pure_server_compute_ms: {:.2}",
+            report.pure_server_compute_ms()
+        );
         println!("correct: true");
+        if let Some(stats) = report.component_timing.as_ref() {
+            print_component_timing(stats);
+        }
     }
     Ok(())
 }
@@ -709,6 +814,7 @@ fn bootstrap_primary_inputs(
     circuit: &PreprocessedCircuit,
     primary_input_bits: &[u64],
     use_grouped_input_cb: bool,
+    mut component_timing: Option<&mut ComponentTimingStats>,
 ) -> Result<HashMap<String, SelectorCiphertext>, Box<dyn Error>> {
     let mut live_signals = HashMap::with_capacity(circuit.inputs.len() + circuit.luts.len());
     let mut input_index = 0usize;
@@ -721,7 +827,15 @@ fn bootstrap_primary_inputs(
                 primary_input_bits[input_index + 1] == 1,
                 primary_input_bits[input_index + 2] == 1,
             ];
-            let selectors = cmux1_keys.bootstrap_boolean_group_standard_br(bits);
+            let input_start = Instant::now();
+            let selectors = if let Some(stats) = component_timing.as_mut() {
+                cmux1_keys.bootstrap_boolean_group_standard_br_timed(bits, stats)
+            } else {
+                cmux1_keys.bootstrap_boolean_group_standard_br(bits)
+            };
+            if let Some(stats) = component_timing.as_mut() {
+                stats.record_input_group_bootstrap(input_start.elapsed());
+            }
             for (offset, selector) in selectors.into_iter().enumerate() {
                 live_signals.insert(circuit.inputs[input_index + offset].clone(), selector);
             }
@@ -730,8 +844,16 @@ fn bootstrap_primary_inputs(
             let fallback_keys = cmux0_keys
                 .or(cmux1_keys)
                 .ok_or("scalar input CB requested without any available key set")?;
-            let selector =
-                fallback_keys.bootstrap_boolean_input(primary_input_bits[input_index] == 1);
+            let input_start = Instant::now();
+            let selector = if let Some(stats) = component_timing.as_mut() {
+                fallback_keys
+                    .bootstrap_boolean_input_timed(primary_input_bits[input_index] == 1, stats)
+            } else {
+                fallback_keys.bootstrap_boolean_input(primary_input_bits[input_index] == 1)
+            };
+            if let Some(stats) = component_timing.as_mut() {
+                stats.record_input_scalar_bootstrap(input_start.elapsed());
+            }
             live_signals.insert(circuit.inputs[input_index].clone(), selector);
             input_index += 1;
         }
@@ -748,6 +870,61 @@ fn materialize_selector_bit(
     let mut one = keys.encrypt_glwe_constant(1, delta);
     cmux_assign(&mut zero, &mut one, selector);
     keys.decrypt_glwe_coefficient0(&zero, delta)
+}
+
+fn print_component_timing(stats: &ComponentTimingStats) {
+    println!();
+    println!("component_timing:");
+    print_stat("input_scalar_lwe_to_rlev", &stats.input_scalar_bootstrap);
+    print_stat("input_group_lwe_to_rlev", &stats.input_group_bootstrap);
+    print_stat("sample_extract_rlwe_to_lwe", &stats.sample_extract);
+    print_stat("keyswitch_large_to_small", &stats.key_switch);
+    print_stat("blind_rotate_pbs_manylut", &stats.blind_rotate);
+    print_stat("conversion_glev_to_ggsw", &stats.conversion);
+    print_stat("fourier_ggsw_conversion", &stats.fourier_conversion);
+    print_stat("single_cmux", &stats.cmux);
+    print_stat("bdd_cmux_tree", &stats.bdd_tree);
+    print_stat("packed_group_eval", &stats.packed_group_eval);
+    print_stat("packed_group_refresh", &stats.packed_group_refresh);
+    print_stat("grouped_lut_eval", &stats.grouped_lut_eval);
+    print_stat("grouped_refresh", &stats.grouped_refresh);
+    print_stat("singleton_lut_eval", &stats.singleton_lut_eval);
+    print_stat("singleton_refresh", &stats.singleton_refresh);
+    print_stat("total_circuit_eval", &stats.total_circuit_eval);
+    if stats.bdd_nodes > 0 {
+        println!(
+            "bdd_tree_ms_per_branch_node: {:.6}",
+            stats.bdd_tree.total_ms() / stats.bdd_nodes as f64
+        );
+    }
+    if stats.packed_group_eval_outputs > 0 {
+        println!(
+            "packed_group_eval_ms_per_output: {:.6}",
+            stats.packed_group_eval.total_ms() / stats.packed_group_eval_outputs as f64
+        );
+    }
+    if stats.packed_group_refresh_outputs > 0 {
+        println!(
+            "packed_group_refresh_ms_per_output: {:.6}",
+            stats.packed_group_refresh.total_ms() / stats.packed_group_refresh_outputs as f64
+        );
+    }
+    if stats.grouped_refresh_outputs > 0 {
+        println!(
+            "grouped_refresh_ms_per_output: {:.6}",
+            stats.grouped_refresh.total_ms() / stats.grouped_refresh_outputs as f64
+        );
+    }
+}
+
+fn print_stat(name: &str, stat: &TimedStat) {
+    println!(
+        "{name}: count={} total_ms={:.6} mean_ms={:.6} variance_ms2={:.6}",
+        stat.count,
+        stat.total_ms(),
+        stat.mean_ms(),
+        stat.variance_ms2()
+    );
 }
 
 fn parse_input_bits(raw: &str, expected_width: usize) -> Result<Vec<u64>, Box<dyn Error>> {

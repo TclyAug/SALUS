@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use aligned_vec::ABox;
 use refined_tfhe_lhe::int_lhe_params::IntLheParam;
@@ -7,7 +8,8 @@ use refined_tfhe_lhe::{
     circuit_bootstrap_lwe_ciphertext_by_trace_with_preprocessing, convert_lwe_to_glwe_const,
     gen_all_auto_keys, gen_blind_rotate_local_assign, generate_scheme_switching_key,
     glwe_ciphertext_clone_from, glwe_ciphertext_monic_monomial_div_assign, keygen_pbs,
-    lwe_preprocessing_assign, polynomial_mul_by_fft, switch_scheme, trace_assign, AutomorphKey,
+    lwe_msb_bit_to_glev_by_trace_with_preprocessing, lwe_preprocessing_assign,
+    polynomial_mul_by_fft, switch_scheme, trace_assign, AutomorphKey,
 };
 use tfhe::core_crypto::{
     algorithms::polynomial_algorithms::polynomial_wrapping_monic_monomial_mul,
@@ -28,6 +30,7 @@ use crate::ms_noise_reduction::{
     improve_lwe_ciphertext_modulus_switch_noise_for_binary_key, NoiseEstimationMeasureBound,
     RSigmaFactor,
 };
+use crate::timing::ComponentTimingStats;
 
 pub type SelectorCiphertext = FourierGgswCiphertext<ABox<[c64]>>;
 pub type SchemeSwitchKey = FourierGgswCiphertextList<Vec<c64>>;
@@ -486,6 +489,76 @@ impl CircuitBootstrapKeys {
         )
     }
 
+    pub fn bootstrap_selector_timed(
+        &self,
+        lwe_in: &LweCiphertext<Vec<u64>>,
+        timing: &mut ComponentTimingStats,
+    ) -> SelectorCiphertext {
+        assert_eq!(
+            lwe_in.lwe_size(),
+            self.large_lwe_secret_key.lwe_dimension().to_lwe_size(),
+            "selector bootstrap expects a large-LWE input"
+        );
+
+        let key_switch_start = Instant::now();
+        let mut small_lwe = self.keyswitch_large_to_small(lwe_in);
+        timing.record_key_switch(key_switch_start.elapsed());
+
+        self.improve_small_lwe_for_blind_rotate(&mut small_lwe, self.params.log_lut_count());
+
+        let polynomial_size = self.fourier_bsk.polynomial_size();
+        let glwe_size = self.fourier_bsk.glwe_size();
+        let ciphertext_modulus = small_lwe.ciphertext_modulus();
+        let cbs_base_log = self.params.cbs_base_log();
+        let cbs_level = self.params.cbs_level();
+
+        let mut glev = GlweCiphertextList::new(
+            0u64,
+            glwe_size,
+            polynomial_size,
+            GlweCiphertextCount(cbs_level.0),
+            ciphertext_modulus,
+        );
+        let glev_mut_view = GlweCiphertextListMutView::from_container(
+            glev.as_mut(),
+            glwe_size,
+            polynomial_size,
+            ciphertext_modulus,
+        );
+
+        let br_start = Instant::now();
+        lwe_msb_bit_to_glev_by_trace_with_preprocessing(
+            small_lwe.as_view(),
+            glev_mut_view,
+            self.fourier_bsk.as_view(),
+            &self.auto_keys,
+            cbs_base_log,
+            cbs_level,
+            self.params.log_lut_count(),
+        );
+        timing.record_blind_rotate(br_start.elapsed());
+
+        let mut ggsw = GgswCiphertext::new(
+            0u64,
+            glwe_size,
+            polynomial_size,
+            cbs_base_log,
+            cbs_level,
+            ciphertext_modulus,
+        );
+        let conversion_start = Instant::now();
+        switch_scheme(&glev, &mut ggsw, self.scheme_switch_key.as_view());
+        timing.record_conversion(conversion_start.elapsed());
+
+        let mut fourier_ggsw =
+            FourierGgswCiphertext::new(glwe_size, polynomial_size, cbs_base_log, cbs_level);
+        let fourier_start = Instant::now();
+        convert_standard_ggsw_ciphertext_to_fourier(&ggsw, &mut fourier_ggsw);
+        timing.record_fourier_conversion(fourier_start.elapsed());
+
+        fourier_ggsw
+    }
+
     pub fn bootstrap_selectors_multi(
         &self,
         lwe_inputs: &[LweCiphertext<Vec<u64>>],
@@ -499,6 +572,15 @@ impl CircuitBootstrapKeys {
     pub fn bootstrap_boolean_input(&self, bit: bool) -> SelectorCiphertext {
         let lwe = self.encrypt_boolean_input(bit);
         self.bootstrap_selector(&lwe)
+    }
+
+    pub fn bootstrap_boolean_input_timed(
+        &self,
+        bit: bool,
+        timing: &mut ComponentTimingStats,
+    ) -> SelectorCiphertext {
+        let lwe = self.encrypt_boolean_input(bit);
+        self.bootstrap_selector_timed(&lwe, timing)
     }
 
     pub fn encrypt_packed_boolean_group_input(
@@ -588,6 +670,31 @@ impl CircuitBootstrapKeys {
             INTER_GROUP_STANDARD_BR_SLOT_START,
             INTER_GROUP_STANDARD_BR_SLOT_STRIDE,
             used_selector_count,
+            None,
+        )
+    }
+
+    fn bootstrap_selector_group_standard_br_spread_from_large_lwe_partial_timed(
+        &self,
+        packed_lwe: &LweCiphertext<Vec<u64>>,
+        used_selector_count: usize,
+        timing: &mut ComponentTimingStats,
+    ) -> Vec<SelectorCiphertext> {
+        assert_eq!(
+            packed_lwe.lwe_size(),
+            self.large_lwe_secret_key.lwe_dimension().to_lwe_size(),
+            "standard-br spread selector bootstrap expects a large-LWE input"
+        );
+        let key_switch_start = Instant::now();
+        let mut small_lwe = self.keyswitch_large_to_small(packed_lwe);
+        timing.record_key_switch(key_switch_start.elapsed());
+        apply_standard_br_input_bias_to_lwe(&mut small_lwe);
+        self.bootstrap_selector_group_standard_br_from_small_lwe_with_layout(
+            &small_lwe,
+            INTER_GROUP_STANDARD_BR_SLOT_START,
+            INTER_GROUP_STANDARD_BR_SLOT_STRIDE,
+            used_selector_count,
+            Some(timing),
         )
     }
 
@@ -604,6 +711,7 @@ impl CircuitBootstrapKeys {
         slot_start: usize,
         slot_stride: usize,
         used_selector_count: usize,
+        mut timing: Option<&mut ComponentTimingStats>,
     ) -> Vec<SelectorCiphertext> {
         assert_eq!(
             packed_lwe.lwe_size(),
@@ -639,6 +747,7 @@ impl CircuitBootstrapKeys {
                 used_outputs,
                 slot_start,
                 slot_stride,
+                timing.as_deref_mut(),
             )
             .expect("shared manylut selector bootstrap should fit the configured layout");
 
@@ -659,11 +768,15 @@ impl CircuitBootstrapKeys {
                     self.large_lwe_secret_key.lwe_dimension().to_lwe_size(),
                     ciphertext_modulus,
                 );
+                let sample_extract_start = Instant::now();
                 extract_lwe_sample_from_glwe_ciphertext(
                     &bootstrapped_levels[output_idx],
                     &mut preprocessed,
                     MonomialDegree(0),
                 );
+                if let Some(stats) = timing.as_deref_mut() {
+                    stats.record_sample_extract(sample_extract_start.elapsed());
+                }
                 let log_scale = u64::BITS as usize - (level_idx + 1) * cbs_base_log.0;
                 lwe_ciphertext_plaintext_add_assign(
                     &mut preprocessed,
@@ -684,11 +797,19 @@ impl CircuitBootstrapKeys {
                 cbs_level,
                 ciphertext_modulus,
             );
+            let conversion_start = Instant::now();
             switch_scheme(&glev, &mut ggsw, self.scheme_switch_key.as_view());
+            if let Some(stats) = timing.as_deref_mut() {
+                stats.record_conversion(conversion_start.elapsed());
+            }
 
             let mut fourier =
                 FourierGgswCiphertext::new(glwe_size, polynomial_size, cbs_base_log, cbs_level);
+            let fourier_start = Instant::now();
             convert_standard_ggsw_ciphertext_to_fourier(&ggsw, &mut fourier);
+            if let Some(stats) = timing.as_deref_mut() {
+                stats.record_fourier_conversion(fourier_start.elapsed());
+            }
             selectors.push(clone_fourier_ggsw(fourier.as_view()));
         }
 
@@ -719,6 +840,7 @@ impl CircuitBootstrapKeys {
                 used_outputs,
                 DENSE_STANDARD_BR_SLOT_START,
                 1,
+                None,
             )
             .expect("shared manylut selector bootstrap should fit the configured layout");
 
@@ -783,13 +905,15 @@ impl CircuitBootstrapKeys {
         _used_outputs: usize,
         _slot_start: usize,
         _slot_stride: usize,
+        timing: Option<&mut ComponentTimingStats>,
     ) -> Result<Vec<GlweCiphertext<Vec<u64>>>, &'static str> {
-        Ok(self.shared_manylut_selector_bootstrap_levels_via_passed_pbs(lwe))
+        Ok(self.shared_manylut_selector_bootstrap_levels_via_passed_pbs(lwe, timing))
     }
 
     fn shared_manylut_selector_bootstrap_levels_via_passed_pbs(
         &self,
         small_lwe: &LweCiphertext<Vec<u64>>,
+        mut timing: Option<&mut ComponentTimingStats>,
     ) -> Vec<GlweCiphertext<Vec<u64>>> {
         const SLOT_COUNT: usize = 8;
         const MANYLUT_LOG_LUT_COUNT: usize = 1;
@@ -844,6 +968,7 @@ impl CircuitBootstrapKeys {
             LutCountLog(MANYLUT_LOG_LUT_COUNT),
         );
 
+        let br_start = Instant::now();
         gen_blind_rotate_local_assign(
             self.fourier_bsk.as_view(),
             local_accumulator.as_mut_view(),
@@ -853,6 +978,9 @@ impl CircuitBootstrapKeys {
             fft_view,
             stack,
         );
+        if let Some(stats) = timing.as_deref_mut() {
+            stats.record_blind_rotate(br_start.elapsed());
+        }
 
         let acc = GlweCiphertext::from_container(
             local_accumulator.as_ref().to_vec(),
@@ -987,6 +1115,25 @@ impl CircuitBootstrapKeys {
         self.bootstrap_selector_group_standard_br_from_large_lwe(&packed_lwe)
     }
 
+    pub fn bootstrap_boolean_group_standard_br_timed(
+        &self,
+        bits: [bool; FUSED_SELECTOR_GROUP_BITS],
+        timing: &mut ComponentTimingStats,
+    ) -> Vec<SelectorCiphertext> {
+        let packed_lwe = self.encrypt_standard_br_boolean_group_input(bits);
+        let key_switch_start = Instant::now();
+        let mut small_lwe = self.keyswitch_large_to_small(&packed_lwe);
+        timing.record_key_switch(key_switch_start.elapsed());
+        apply_standard_br_input_bias_to_lwe(&mut small_lwe);
+        self.bootstrap_selector_group_standard_br_from_small_lwe_with_layout(
+            &small_lwe,
+            DENSE_STANDARD_BR_SLOT_START,
+            1,
+            FUSED_SELECTOR_GROUP_BITS,
+            Some(timing),
+        )
+    }
+
     pub fn debug_bootstrap_boolean_group_standard_br_pretrace(
         &self,
         bits: [bool; FUSED_SELECTOR_GROUP_BITS],
@@ -1005,6 +1152,7 @@ impl CircuitBootstrapKeys {
                 used_outputs,
                 slot_start,
                 slot_stride,
+                None,
             )
             .expect("shared manylut selector bootstrap should fit the configured layout");
 
@@ -1042,6 +1190,7 @@ impl CircuitBootstrapKeys {
                 used_outputs,
                 DENSE_STANDARD_BR_SLOT_START,
                 1,
+                None,
             )
             .expect("shared manylut selector bootstrap should fit the configured layout");
 
@@ -1079,6 +1228,7 @@ impl CircuitBootstrapKeys {
                 used_outputs,
                 slot_start,
                 slot_stride,
+                None,
             )
             .expect("shared manylut selector bootstrap should fit the configured layout");
 
@@ -1129,7 +1279,7 @@ impl CircuitBootstrapKeys {
     ) -> Vec<i128> {
         let small_lwe = self.debug_standard_br_group_pbs_input(bits);
         let bootstrapped_levels =
-            self.shared_manylut_selector_bootstrap_levels_via_passed_pbs(&small_lwe);
+            self.shared_manylut_selector_bootstrap_levels_via_passed_pbs(&small_lwe, None);
 
         let mut out = Vec::with_capacity(FUSED_SELECTOR_GROUP_BITS * self.params.cbs_level().0);
         for selector_idx in 0..FUSED_SELECTOR_GROUP_BITS {
@@ -1188,7 +1338,7 @@ impl CircuitBootstrapKeys {
 
         let small_lwe = self.debug_standard_br_group_pbs_input_from_large_lwe(packed_lwe);
         let bootstrapped_levels =
-            self.shared_manylut_selector_bootstrap_levels_via_passed_pbs(&small_lwe);
+            self.shared_manylut_selector_bootstrap_levels_via_passed_pbs(&small_lwe, None);
 
         let glwe_size = self.params.glwe_dimension().to_glwe_size();
         let polynomial_size = self.params.polynomial_size();
@@ -1353,6 +1503,17 @@ impl CircuitBootstrapKeys {
         lwe_out
     }
 
+    pub fn extract_coefficient0_as_lwe_timed(
+        &self,
+        glwe_in: &GlweCiphertext<Vec<u64>>,
+        timing: &mut ComponentTimingStats,
+    ) -> LweCiphertext<Vec<u64>> {
+        let sample_extract_start = Instant::now();
+        let lwe_out = self.extract_coefficient0_as_lwe(glwe_in);
+        timing.record_sample_extract(sample_extract_start.elapsed());
+        lwe_out
+    }
+
     pub fn keyswitch_large_to_small(
         &self,
         lwe_in: &LweCiphertext<Vec<u64>>,
@@ -1404,6 +1565,17 @@ impl CircuitBootstrapKeys {
         self.bootstrap_selector(&large_lwe)
     }
 
+    pub fn glwe_boolean_to_selector_timed(
+        &self,
+        glwe_in: &GlweCiphertext<Vec<u64>>,
+        timing: &mut ComponentTimingStats,
+    ) -> SelectorCiphertext {
+        let sample_extract_start = Instant::now();
+        let large_lwe = self.extract_coefficient0_as_lwe(glwe_in);
+        timing.record_sample_extract(sample_extract_start.elapsed());
+        self.bootstrap_selector_timed(&large_lwe, timing)
+    }
+
     pub fn glwe_booleans_to_selectors_multi(
         &self,
         glwe_inputs: &[GlweCiphertext<Vec<u64>>],
@@ -1434,6 +1606,34 @@ impl CircuitBootstrapKeys {
             // Keep each CMUX tree on the same 0/1 carrier, then apply the
             // 1/2/4 inter-group weighting only after coefficient extraction.
             let mut large_lwe = self.extract_coefficient0_as_lwe(glwe_in);
+            let weight = 1u64 << bit_index;
+            lwe_ciphertext_cleartext_mul_assign(&mut large_lwe, Cleartext(weight));
+            lwe_ciphertext_add_assign(&mut packed_lwe, &large_lwe);
+        }
+
+        packed_lwe
+    }
+
+    pub fn pack_weighted_glwe_outputs_to_large_lwe_timed(
+        &self,
+        glwe_inputs: &[GlweCiphertext<Vec<u64>>],
+        timing: &mut ComponentTimingStats,
+    ) -> LweCiphertext<Vec<u64>> {
+        assert!(
+            (1..=FUSED_SELECTOR_GROUP_BITS).contains(&glwe_inputs.len()),
+            "expected between one and three GLWE outputs for selector bootstrap"
+        );
+
+        let mut packed_lwe = LweCiphertext::new(
+            0u64,
+            self.large_lwe_secret_key.lwe_dimension().to_lwe_size(),
+            self.params.ciphertext_modulus(),
+        );
+
+        for (bit_index, glwe_in) in glwe_inputs.iter().enumerate() {
+            let sample_extract_start = Instant::now();
+            let mut large_lwe = self.extract_coefficient0_as_lwe(glwe_in);
+            timing.record_sample_extract(sample_extract_start.elapsed());
             let weight = 1u64 << bit_index;
             lwe_ciphertext_cleartext_mul_assign(&mut large_lwe, Cleartext(weight));
             lwe_ciphertext_add_assign(&mut packed_lwe, &large_lwe);
@@ -1473,6 +1673,23 @@ impl CircuitBootstrapKeys {
         )
     }
 
+    pub fn weighted_glwe_outputs_to_selectors_standard_br_timed(
+        &self,
+        glwe_inputs: &[GlweCiphertext<Vec<u64>>],
+        timing: &mut ComponentTimingStats,
+    ) -> Vec<SelectorCiphertext> {
+        let used_selector_count = glwe_inputs.len();
+        let mut packed_lwe =
+            self.pack_weighted_glwe_outputs_to_large_lwe_timed(glwe_inputs, timing);
+        let base_offset = inter_group_standard_br_base_offset();
+        lwe_ciphertext_plaintext_add_assign(&mut packed_lwe, Plaintext(base_offset));
+        self.bootstrap_selector_group_standard_br_spread_from_large_lwe_partial_timed(
+            &packed_lwe,
+            used_selector_count,
+            timing,
+        )
+    }
+
     pub fn packed_large_lwe_to_selectors_standard_br(
         &self,
         packed_lwe: &LweCiphertext<Vec<u64>>,
@@ -1491,6 +1708,22 @@ impl CircuitBootstrapKeys {
     ) -> Vec<SelectorCiphertext> {
         let packed_lwe = self.extract_coefficient0_as_lwe(packed_glwe);
         self.packed_large_lwe_to_selectors_standard_br(&packed_lwe, used_selector_count)
+    }
+
+    pub fn packed_glwe_to_selectors_standard_br_timed(
+        &self,
+        packed_glwe: &GlweCiphertext<Vec<u64>>,
+        used_selector_count: usize,
+        timing: &mut ComponentTimingStats,
+    ) -> Vec<SelectorCiphertext> {
+        let sample_extract_start = Instant::now();
+        let packed_lwe = self.extract_coefficient0_as_lwe(packed_glwe);
+        timing.record_sample_extract(sample_extract_start.elapsed());
+        self.bootstrap_selector_group_standard_br_spread_from_large_lwe_partial_timed(
+            &packed_lwe,
+            used_selector_count,
+            timing,
+        )
     }
 
     pub fn decrypt_large_lwe(&self, lwe_in: &LweCiphertext<Vec<u64>>, delta: u64) -> u64 {
