@@ -10,7 +10,8 @@ use refined_tfhe_lhe::int_lhe_instance::{
 use salus::{
     encode_inter_group_standard_br_value, evaluate_bdd_with_refs, evaluate_bdd_with_refs_timed,
     inter_group_standard_br_bit_delta, Bdd, CircuitBootstrapKeys, ComponentTimingStats,
-    ImportedDagData, PreprocessedCircuit, SelectorCiphertext, TimedStat, FUSED_SELECTOR_GROUP_BITS,
+    ImportedDagData, PreprocessedCircuit, PreprocessedLut, SelectorCiphertext, TimedStat,
+    FUSED_SELECTOR_GROUP_BITS,
 };
 use tfhe::core_crypto::prelude::*;
 
@@ -37,11 +38,60 @@ struct RunReport {
     bdd_eval_ms: f64,
     inter_lut_cb_ms: f64,
     component_timing: Option<ComponentTimingStats>,
+    layer_trace: Option<LayerTraceReport>,
 }
 
 impl RunReport {
     fn pure_server_compute_ms(&self) -> f64 {
         self.input_selector_bootstrap_ms + self.bdd_eval_ms + self.inter_lut_cb_ms
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LayerTrace {
+    layer_number: usize,
+    lut_count: usize,
+    packed_group_count: usize,
+    cmux_count: usize,
+    blind_rotate_count: usize,
+    refresh_output_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct LayerTraceReport {
+    input_count: usize,
+    input_blind_rotate_count: usize,
+    layers: Vec<LayerTrace>,
+}
+
+impl LayerTraceReport {
+    fn new(input_count: usize, input_blind_rotate_count: usize, levels: &[Vec<usize>]) -> Self {
+        Self {
+            input_count,
+            input_blind_rotate_count,
+            layers: levels
+                .iter()
+                .enumerate()
+                .map(|(layer_number, level)| LayerTrace {
+                    layer_number,
+                    lut_count: level.len(),
+                    packed_group_count: 0,
+                    cmux_count: 0,
+                    blind_rotate_count: 0,
+                    refresh_output_count: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn merge(&mut self, other: &LayerTraceReport) {
+        self.input_blind_rotate_count += other.input_blind_rotate_count;
+        for (current, incoming) in self.layers.iter_mut().zip(other.layers.iter()) {
+            current.packed_group_count += incoming.packed_group_count;
+            current.cmux_count += incoming.cmux_count;
+            current.blind_rotate_count += incoming.blind_rotate_count;
+            current.refresh_output_count += incoming.refresh_output_count;
+        }
     }
 }
 
@@ -90,8 +140,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         take_flag(&mut optional_args, "--hybrid-cmux1-inputs");
     let requested_grouped_inter_cb = take_flag(&mut optional_args, "--grouped-inter-cb");
     let requested_packed_merge_groups = take_flag(&mut optional_args, "--packed-merge-groups");
+    let disable_packed_merge_groups = take_flag(&mut optional_args, "--no-packed-merge-groups");
+    let skip_final_refresh = take_flag(&mut optional_args, "--skip-final-refresh");
     let requested_legacy_debug_scalar_eval = take_flag(&mut optional_args, "--debug-eval-cmux0");
     let component_timing_enabled = take_flag(&mut optional_args, "--component-timing");
+    let layer_trace_enabled = take_flag(&mut optional_args, "--layer-trace");
     let fixed_seed = parse_u64_option(&mut optional_args, "--seed")?;
     let grouped_inter_level_limit =
         parse_usize_option(&mut optional_args, "--grouped-inter-level-limit")?;
@@ -128,7 +181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let use_grouped_path = route.uses_grouped_path();
     let use_grouped_input_cb = use_grouped_path;
     let use_weighted_grouped_inter_cb = route.uses_weighted_grouping();
-    let use_packed_merge_groups = use_grouped_path;
+    let use_packed_merge_groups = use_grouped_path && !disable_packed_merge_groups;
     let use_scalar_singletons = matches!(route, EvalRoute::Single | EvalRoute::Hybrid);
     let use_grouped_singletons = matches!(route, EvalRoute::Multi);
     let circuit = PreprocessedCircuit::read_from_dir(Path::new(&dir_path))?;
@@ -222,6 +275,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("at least one key set must be available");
     let run_once = |primary_input_bits: &[u64]| -> Result<RunReport, Box<dyn Error>> {
         let mut component_timing = component_timing_enabled.then(ComponentTimingStats::default);
+        let mut layer_trace = layer_trace_enabled.then(|| {
+            LayerTraceReport::new(
+                circuit.inputs.len(),
+                count_input_blind_rotates(circuit.inputs.len(), use_grouped_input_cb),
+                &circuit.levels,
+            )
+        });
         let plain_signal_values =
             evaluate_preprocessed_plain(&circuit, &dag_map, primary_input_bits)?;
         let expected_outputs = circuit
@@ -314,6 +374,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         stats.record_bdd_tree(bdd_elapsed, packed_bdd.branch_count());
                         stats.record_packed_group_eval(bdd_elapsed, group.lut_indices.len());
                     }
+                    if let Some(trace) = layer_trace.as_mut() {
+                        let layer = &mut trace.layers[level_number];
+                        layer.packed_group_count += 1;
+                        layer.cmux_count += packed_bdd.branch_count();
+                    }
 
                     let cb_start = Instant::now();
                     let cmux1_keys = cmux1_keys
@@ -335,6 +400,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     total_cb_ms += cb_elapsed.as_secs_f64() * 1000.0;
                     if let Some(stats) = component_timing.as_mut() {
                         stats.record_packed_group_refresh(cb_elapsed, group.lut_indices.len());
+                    }
+                    if let Some(trace) = layer_trace.as_mut() {
+                        let layer = &mut trace.layers[level_number];
+                        layer.blind_rotate_count += 1;
+                        layer.refresh_output_count += group.lut_indices.len();
                     }
 
                     for (selector_idx, (&lut_index, selector)) in
@@ -399,10 +469,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             let mut level_index = 0usize;
             while level_index < remaining_level_luts.len() {
-                let remaining_level = remaining_level_luts.len() - level_index;
                 let group_width = if weighted_group_this_level {
-                    if remaining_level >= 2 {
-                        remaining_level.min(FUSED_SELECTOR_GROUP_BITS)
+                    let non_final_run = remaining_level_luts[level_index..]
+                        .iter()
+                        .take_while(|&&lut_index| {
+                            !is_final_only_lut(
+                                &circuit.luts[lut_index],
+                                &output_names,
+                                &remaining_refs,
+                            )
+                        })
+                        .count();
+                    if non_final_run >= 2 {
+                        non_final_run.min(FUSED_SELECTOR_GROUP_BITS)
                     } else {
                         0
                     }
@@ -463,6 +542,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if let Some(stats) = component_timing.as_mut() {
                             stats.record_bdd_tree(bdd_elapsed, bdd.branch_count());
                             stats.record_grouped_lut_eval(bdd_elapsed);
+                        }
+                        if let Some(trace) = layer_trace.as_mut() {
+                            trace.layers[level_number].cmux_count += bdd.branch_count();
                         }
 
                         let actual_value =
@@ -528,6 +610,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     total_cb_ms += cb_elapsed.as_secs_f64() * 1000.0;
                     if let Some(stats) = component_timing.as_mut() {
                         stats.record_grouped_refresh(cb_elapsed, group_width);
+                    }
+                    if let Some(trace) = layer_trace.as_mut() {
+                        let layer = &mut trace.layers[level_number];
+                        layer.blind_rotate_count += 1;
+                        layer.refresh_output_count += group_width;
                     }
 
                     for ((name, expected_value), selector) in grouped_names
@@ -596,6 +683,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         stats.record_bdd_tree(bdd_elapsed, bdd.branch_count());
                         stats.record_singleton_lut_eval(bdd_elapsed);
                     }
+                    if let Some(trace) = layer_trace.as_mut() {
+                        trace.layers[level_number].cmux_count += bdd.branch_count();
+                    }
 
                     let actual_value = verify_keys.decrypt_glwe_coefficient0(&lut_glwe, delta);
                     if actual_value != expected_value {
@@ -627,6 +717,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if output_names.contains(&lut.name) {
                         final_output_glwes.insert(lut.name.clone(), (lut_glwe.clone(), delta));
                     }
+                    let skip_refresh =
+                        skip_final_refresh && is_final_only_lut(lut, &output_names, &remaining_refs);
 
                     for input_name in &lut.inputs {
                         if let Some(remaining) = remaining_refs.get_mut(input_name) {
@@ -635,6 +727,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 live_signals.remove(input_name);
                             }
                         }
+                    }
+
+                    if skip_refresh {
+                        level_index += 1;
+                        continue;
                     }
 
                     let cb_start = Instant::now();
@@ -656,6 +753,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     total_cb_ms += cb_elapsed.as_secs_f64() * 1000.0;
                     if let Some(stats) = component_timing.as_mut() {
                         stats.record_singleton_refresh(cb_elapsed);
+                    }
+                    if let Some(trace) = layer_trace.as_mut() {
+                        let layer = &mut trace.layers[level_number];
+                        layer.blind_rotate_count += 1;
+                        layer.refresh_output_count += 1;
                     }
                     live_signals.insert(lut.name.clone(), selector);
                     level_index += 1;
@@ -702,6 +804,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             bdd_eval_ms: total_bdd_ms,
             inter_lut_cb_ms: total_cb_ms,
             component_timing,
+            layer_trace,
         })
     };
 
@@ -711,6 +814,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut total_ms = 0.0;
         let mut aggregate_component_timing =
             component_timing_enabled.then(ComponentTimingStats::default);
+        let mut aggregate_layer_trace: Option<LayerTraceReport> = None;
 
         for run_idx in 0..repeat_count {
             let primary_input_bits = random_input_bits(circuit.inputs.len(), &mut rng);
@@ -721,6 +825,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 report.component_timing.as_ref(),
             ) {
                 aggregate.merge(run_timing);
+            }
+            if let Some(run_trace) = report.layer_trace.as_ref() {
+                if let Some(aggregate) = aggregate_layer_trace.as_mut() {
+                    aggregate.merge(run_trace);
+                } else {
+                    aggregate_layer_trace = Some(run_trace.clone());
+                }
             }
             println!("run_{}:", run_idx + 1);
             println!("input_bits: {}", format_bits(&primary_input_bits));
@@ -742,6 +853,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(stats) = aggregate_component_timing.as_ref() {
             print_component_timing(stats);
         }
+        if let Some(trace) = aggregate_layer_trace.as_ref() {
+            print_layer_trace(trace);
+        }
     } else {
         let primary_input_bits =
             provided_input_bits.unwrap_or_else(|| vec![0; circuit.inputs.len()]);
@@ -756,6 +870,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("correct: true");
         if let Some(stats) = report.component_timing.as_ref() {
             print_component_timing(stats);
+        }
+        if let Some(trace) = report.layer_trace.as_ref() {
+            print_layer_trace(trace);
         }
     }
     Ok(())
@@ -927,6 +1044,26 @@ fn print_stat(name: &str, stat: &TimedStat) {
     );
 }
 
+fn print_layer_trace(trace: &LayerTraceReport) {
+    println!();
+    println!("layer_trace:");
+    println!(
+        "input_trace: inputs={} blind_rotate={}",
+        trace.input_count, trace.input_blind_rotate_count
+    );
+    for layer in &trace.layers {
+        println!(
+            "layer_trace: layer={} luts={} packed_groups={} cmux={} blind_rotate={} refresh_outputs={}",
+            layer.layer_number + 1,
+            layer.lut_count,
+            layer.packed_group_count,
+            layer.cmux_count,
+            layer.blind_rotate_count,
+            layer.refresh_output_count
+        );
+    }
+}
+
 fn parse_input_bits(raw: &str, expected_width: usize) -> Result<Vec<u64>, Box<dyn Error>> {
     let trimmed = raw.strip_prefix("0b").unwrap_or(raw);
     if trimmed.len() > expected_width {
@@ -993,4 +1130,27 @@ fn now_seed() -> u64 {
 
 fn random_input_bits(width: usize, rng: &mut XorShift64) -> Vec<u64> {
     (0..width).map(|_| rng.next_bit()).collect()
+}
+
+fn is_final_only_lut(
+    lut: &PreprocessedLut,
+    output_names: &std::collections::HashSet<String>,
+    remaining_refs: &HashMap<String, usize>,
+) -> bool {
+    output_names.contains(&lut.name) && remaining_refs.get(&lut.name).copied().unwrap_or(0) <= 1
+}
+
+fn count_input_blind_rotates(input_width: usize, use_grouped_input_cb: bool) -> usize {
+    let mut count = 0usize;
+    let mut input_index = 0usize;
+    while input_index < input_width {
+        let remaining = input_width - input_index;
+        if use_grouped_input_cb && remaining >= FUSED_SELECTOR_GROUP_BITS {
+            input_index += FUSED_SELECTOR_GROUP_BITS;
+        } else {
+            input_index += 1;
+        }
+        count += 1;
+    }
+    count
 }
